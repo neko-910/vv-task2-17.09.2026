@@ -240,53 +240,58 @@ PAEI не должен самостоятельно классифицирова
 
 ### 9.1. Потеря контакта
 
-Потеря контакта возникает при выполнении утверждённого условия, например:
+Потеря контакта возникает автоматически после применения изменения состояния, если:
 
 ```text
-contact <= contact_loss_threshold
+contact <= 20
 ```
 
-Значение `contact_loss_threshold` задаётся конфигурацией сценария или сложности.
+В MVP `contact_lost` является **промежуточным состоянием**, а не немедленным окончательным поражением.
 
-Возможные варианты:
+При переходе в `contact_lost`:
+- текущая `progress` сохраняется;
+- дальнейшие обычные действия блокируются;
+- пользователю предоставляется **один следующий ход на восстановление**;
+- событие `contact_lost` обязательно записывается в историю.
 
-- переход в `contact_lost` с возможностью восстановления;
-- продолжение игры с ограничениями;
-- немедленное завершение;
-- переход в `failure`.
-
-Конкретный вариант должен быть утверждён в Task 1.
+Если восстановление не удалось на следующем ходу, состояние изменяется на `failure`.
 
 ### 9.2. Восстановление
 
-Восстановление допускается только при выполнении сценарного условия, например:
+Для MVP восстановление считается успешным, только если одновременно выполнены условия:
 
-- пользователь выбирает допустимый способ исправления;
-- предлагает рабочую альтернативу;
-- признаёт ошибку и формулирует корректирующее действие;
-- выполняет специальное условие сценария.
-
-Готовая реплика для восстановления не должна автоматически выдаваться пользователю.
-
-Примеры событий:
-
-```json
-{
-  "event_type": "contact_lost",
-  "previous_contact": 12,
-  "current_contact": 0,
-  "turn_number": 3
-}
+```text
+action_type == recovery_action
+AND conversation_progress == forward
+AND actionability == high
+AND weighted_paei_fit >= 0
 ```
 
-```json
-{
-  "event_type": "contact_recovered",
-  "previous_contact": 0,
-  "current_contact": 20,
-  "turn_number": 4
-}
+Для `Hard` дополнительно:
+
+```text
+weighted_paei_fit >= +1
 ```
+
+Успешное восстановление даёт:
+
+```text
+contact += 15
+resistance -= 10
+progress += 5
+```
+
+После этого применяются границы `0..100`, а состояние возвращается в `active`.
+
+Восстановление разрешено **один раз за сценарий**. Повторная потеря контакта после уже использованного восстановления приводит к `failure`.
+
+Подходящий пример восстановления:
+
+> «Понимаю, что сорвал срок. Сегодня передам готовую часть, завтра до 12:00 закончу оставшееся и зафиксирую новый план».
+
+Недостаточно:
+
+> «Извините, постараюсь исправиться».
 
 ---
 
@@ -362,23 +367,15 @@ negotiation_quality =
     clamp(50 + Σ quality_delta − 3 * hints_used, 0, 100)
 ```
 
-`paei_result` рассчитывается по средней оценке `communication_fit` за завершённые ходы:
+`paei_result` рассчитывается отдельно по P/A/E/I, а затем агрегируется с весами профиля NPC. Полное правило приведено в разделе 11.4.
+
+Для каждого профиля используется диапазон:
 
 ```text
-paei_result = clamp(50 + 25 * average_communication_fit, 0, 100)
+fit_X ∈ [-2, +2]
 ```
 
-где `average_communication_fit` находится в диапазоне `−2..+2`.
-
-Соответствие средней оценки и итогового PAEI-балла:
-
-| Средний `communication_fit` | `paei_result` |
-|---:|---:|
-| −2.0 | 0 |
-| −1.0 | 25 |
-| 0.0 | 50 |
-| +1.0 | 75 |
-| +2.0 | 100 |
+После каждого хода четыре значения сохраняются в `profile_fit_history`.
 
 `goal_result` для MVP:
 
@@ -394,6 +391,110 @@ goal_result =
 ```
 
 `completed_optional_goals` не должен быть отрицательным и ограничивается количеством дополнительных целей сценария.
+
+### 10.4. Классификация действий
+
+Каждое пользовательское сообщение получает ровно один `action_type`.
+
+Порядок проверки:
+
+1. Сначала проверяются критические условия сценария.
+2. Затем определяется направление диалога (`backward / neutral / forward`).
+3. Затем рассчитывается `weighted_paei_fit`.
+4. Затем выбирается класс действия.
+
+Правила MVP:
+
+| Условие | `action_type` |
+|---|---|
+| Выполнено хотя бы одно критическое условие | `critical_error` |
+| `conversation_progress = forward`, `actionability = high`, `solution_orientation = solution`, `weighted_paei_fit >= +1` | `strong_positive` |
+| `conversation_progress = forward`, `weighted_paei_fit >= 0` | `positive` |
+| `conversation_progress = neutral` и нет негативного сценарного флага | `neutral` |
+| `conversation_progress = backward` или `weighted_paei_fit <= -1` | `negative` |
+| Игра находится в `contact_lost` и выполнены условия восстановления | `recovery_action` |
+
+Если сообщение одновременно подходит под несколько некритических классов, выбирается класс с более высоким приоритетом:
+
+```text
+critical_error
+>
+recovery_action
+>
+strong_positive
+>
+positive
+>
+neutral
+>
+negative
+```
+
+`weighted_paei_fit` рассчитывается до классификации действия:
+
+```text
+weighted_paei_fit =
+    Σ(profile_weight_X * fit_X)
+```
+
+где `X ∈ {P, A, E, I}`. Результат ограничивается `[-2, +2]`.
+
+### 10.5. Структура переговорного сценария
+
+Каждый MVP-сценарий состоит из четырех фаз:
+
+| Фаза | Назначение | Ожидаемый результат |
+|---|---|---|
+| `opening` | вводная, цели и рамка разговора | участники понимают предмет переговоров |
+| `diagnosis` | выяснение интересов, ограничений и критериев | определены ключевые интересы и ограничения |
+| `bargaining` | варианты, аргументация, обмен условиями | сформирован приемлемый вариант |
+| `closing` | фиксация договорённости и следующего шага | выполнены обязательные условия сценария |
+
+Нормальный сценарий рассчитан на `8–12` ходов. Рекомендуемая схема:
+
+```text
+opening      → 1–2 хода
+diagnosis    → 2–3 хода
+bargaining   → 3–4 хода
+closing      → 2–3 хода
+```
+
+Каждая фаза имеет:
+- `entry_condition`;
+- `required_objectives`;
+- `optional_objectives`;
+- `exit_condition`;
+- набор допустимых сценарных событий.
+
+Сценарий может завершиться раньше 12 ходов, если выполнены все обязательные условия успеха.
+
+Минимальная конфигурация сценария:
+
+```yaml
+scenario_id: scenario_001
+title: "Переговоры о сроках проекта"
+npc_profile_weights:
+  P: 0.25
+  A: 0.25
+  E: 0.25
+  I: 0.25
+
+mandatory_goals:
+  - agree_on_realistic_deadline
+  - define_next_step
+
+optional_goals:
+  - preserve_relationship
+  - propose_alternative
+
+hard_constraints:
+  - no_false_commitments
+  - no_personal_attacks
+
+turn_limit: 12
+```
+
+---
 
 ### 10.3. Пороговые значения Normal
 
@@ -430,19 +531,104 @@ PAEI оценивает соответствие сообщения пользо
 | `-1` | слабое несоответствие |
 | `-2` | сильное несоответствие |
 
-### 11.2. Наблюдаемые признаки
+### 11.2. Полный состав PAEI-профилей
 
-Evaluator должен работать с наблюдаемыми признаками, а не с предположениями о психологии пользователя.
+В MVP используются четыре независимые функции:
 
-Примеры признаков:
+| Профиль | Основной фокус | Ключевые наблюдаемые признаки |
+|---|---|---|
+| **P** | результат и действие | `result_clarity`, `deadline_clarity`, `actionability`, `ownership`, `solution_orientation` |
+| **A** | порядок и управляемость | `process_clarity`, `sequence_clarity`, `evidence_quality`, `risk_identification`, `criteria_clarity` |
+| **E** | возможности и будущее | `alternative_present`, `future_value`, `innovation_orientation`, `optionality`, `risk_upside_balance` |
+| **I** | совместность и устойчивость взаимодействия | `interest_acknowledgement`, `common_ground`, `perspective_taking`, `inclusive_language`, `respectfulness`, `buy_in_check`, `shared_ownership`, `listening_evidence` |
 
-- для P: `result_clarity`, `deadline_clarity`, `actionability`, `ownership`, `solution_orientation`;
-- для A: `process_clarity`, `sequence_clarity`, `evidence_quality`, `risk_identification`, `criteria_clarity`;
-- для E: `alternative_present`, `future_value`, `innovation_orientation`, `optionality`, `risk_upside_balance`.
+Полный профиль NPC задаётся вектором:
 
-Список признаков E, I и состав итогового PAEI-результата должны быть согласованы с полной методологией проекта.
+```yaml
+P: 0.25
+A: 0.25
+E: 0.25
+I: 0.25
+```
 
-### 11.3. Правило разделения слоёв
+Сумма весов обязана быть равна `1.0`.
+
+Для MVP предусмотрены готовые шаблоны:
+
+| Тип NPC | P | A | E | I |
+|---|---:|---:|---:|---:|
+| `balanced` | 0.25 | 0.25 | 0.25 | 0.25 |
+| `P_dominant` | 0.55 | 0.20 | 0.15 | 0.10 |
+| `A_dominant` | 0.15 | 0.55 | 0.20 | 0.10 |
+| `E_dominant` | 0.15 | 0.20 | 0.55 | 0.10 |
+| `I_dominant` | 0.15 | 0.20 | 0.10 | 0.55 |
+
+Шаблон выбирается на уровне сценария и не изменяется сам по себе в ходе переговоров.
+
+### 11.3. Расчёт communication fit
+
+Для каждого профиля Evaluator получает набор наблюдаемых признаков и сопоставляет их с правилами профиля из методологических документов.
+
+Каждое совпавшее положительное правило даёт `+1` или `+2`, а отрицательное правило — `-1` или `-2`. При наличии нескольких признаков они суммируются и ограничиваются:
+
+```text
+profile_fit =
+    clamp(sum(rule_contributions), -2, +2)
+```
+
+Таким образом, противоречивые сигналы могут взаимно компенсироваться, а один набор признаков не может вывести оценку за диапазон `-2..+2`.
+
+Примеры логики:
+- конкретный результат + реалистичный срок + следующий шаг → высокий fit для P;
+- пошаговый план + доказательства + контроль риска → высокий fit для A;
+- несколько вариантов + эксперимент + будущая ценность → высокий fit для E;
+- признание интересов + общее основание + проверка buy-in → высокий fit для I.
+
+### 11.4. Итоговый PAEI
+
+Для каждого профиля отдельно вычисляется:
+
+```text
+profile_result_X =
+    clamp(
+        50 + 25 * average_fit_X,
+        0,
+        100
+    )
+```
+
+где `X ∈ {P, A, E, I}`, а `average_fit_X` находится в диапазоне `-2..+2`.
+
+Итоговый `paei_result`:
+
+```text
+paei_result =
+    Σ(profile_weight_X * profile_result_X)
+```
+
+с условием:
+
+```text
+profile_weight_P
++ profile_weight_A
++ profile_weight_E
++ profile_weight_I = 1
+```
+
+Если сценарий использует чистый профиль, например только P:
+
+```text
+P = 1.0
+A = 0.0
+E = 0.0
+I = 0.0
+```
+
+Тогда результат полностью определяется P.
+
+Evaluator хранит четыре значения fit за каждый ход, поэтому итог PAEI можно полностью пересчитать по `profile_fit_history` без повторного обращения к AI.
+
+### 11.5. Правило разделения слоёв
 
 ```text
 PAEI fit
@@ -504,11 +690,16 @@ reason: expected_result_not_delivered
 
 Для MVP принимается единое правило: каждая использованная подсказка уменьшает `negotiation_quality` на **3 балла**, но не влияет напрямую на `goal_result` и `paei_result`.
 
-При лимите в 3 подсказки максимальный суммарный штраф составляет 9 баллов.
+Лимиты подсказок:
+- `Easy` — 5;
+- `Normal` — 3;
+- `Hard` — 2.
+
+Подсказка доступна не чаще одного раза за ход и не может использоваться после перехода в терминальное состояние.
+
+Максимальный суммарный штраф на `Normal` — 9 баллов.
 
 Правило применяется одинаково ко всем типам подсказок и реализуется только через Game Engine.
-
-До утверждения следующих версий документа это правило считается рабочей конфигурацией MVP (`DRAFT`).
 
 ---
 
@@ -545,7 +736,20 @@ reason: expected_result_not_delivered
 - использование подсказок;
 - соблюдение сценарных ограничений.
 
-Точные веса должны быть согласованы отдельно.
+Для MVP `negotiation_quality` определяется не отдельной сложной весовой моделью, а суммой фиксированных `quality_delta`:
+
+```text
+negotiation_quality =
+    clamp(
+        50
+        + Σ quality_delta
+        - 3 * hints_used,
+        0,
+        100
+    )
+```
+
+Дополнительно итоговое качество не может считаться успешным само по себе: обязательные условия сценария остаются отдельными условиями победы.
 
 ### 13.3. PAEI
 
@@ -628,25 +832,34 @@ Final Result = 0.50 * Goal Result + 0.30 * Negotiation Quality + 0.20 * PAEI Res
 | `initial_contact` | 80 | 70 | 60 |
 | `initial_resistance` | 20 | 40 | 60 |
 | `contact_loss_threshold` | 20 | 20 | 20 |
+| `goal_threshold` | 80 | 80 | 80 |
 | `hint_limit` | 5 | 3 | 2 |
 | `negative_action_strength` | 4 | 6 | 8 |
-| `recovery_difficulty` | лёгкое | среднее | высокое |
+| `recovery_difficulty` | 0 | 1 | 2 |
 | `turn_limit` | 15 | 12 | 10 |
 | `critical_error_limit` | 4 | 3 | 2 |
+| `recovery_attempt_limit` | 1 | 1 | 1 |
 
 Для `recovery_difficulty`:
 - `Easy`: достаточно одного корректирующего действия;
 - `Normal`: требуется корректирующее действие с положительным результатом;
 - `Hard`: требуется корректирующее действие с `communication_fit >= +1`.
 
-Для каждого параметра должны быть определены:
+Допустимые диапазоны MVP:
 
-- допустимый диапазон;
-- значение по умолчанию;
-- правило применения;
-- влияние на Game State;
-- unit-тесты;
-- связь с режимом игры.
+| Параметр | Диапазон | Значение по умолчанию | Правило |
+|---|---|---:|---|
+| `initial_contact` | 40–90 | 70 | стартовое состояние |
+| `initial_resistance` | 10–70 | 40 | стартовое препятствие |
+| `contact_loss_threshold` | 10–30 | 20 | переход в `contact_lost` |
+| `goal_threshold` | 70–90 | 80 | минимальный progress для успеха |
+| `hint_limit` | 0–5 | 3 | максимум подсказок |
+| `negative_action_strength` | 2–10 | 6 | применяется к сильному негативному действию |
+| `turn_limit` | 8–15 | 12 | максимум обычных ходов |
+| `critical_error_limit` | 2–5 | 3 | предел критических ошибок |
+| `recovery_attempt_limit` | 1 | 1 | один шанс на восстановление |
+
+Все параметры загружаются из versioned scenario configuration.
 
 ---
 
@@ -654,46 +867,78 @@ Final Result = 0.50 * Goal Result + 0.30 * Negotiation Quality + 0.20 * PAEI Res
 
 Каждое изменение состояния должно быть связано с событием.
 
+Обязательный формат MVP:
+
 ```json
 {
-  "event_id": "evt-0001",
+  "event_id": "evt-000007",
   "event_type": "action_processed",
-  "turn_number": 1,
-  "action_type": "user_message",
-  "profile": "P",
+  "session_id": "sess-001",
+  "scenario_id": "scenario_001",
+  "scenario_version": "1.0",
+  "scoring_version": "0.3",
+  "turn_number": 7,
+  "action_type": "positive",
+  "profile_weights": {
+    "P": 0.25,
+    "A": 0.25,
+    "E": 0.25,
+    "I": 0.25
+  },
+  "profile_fit": {
+    "P": 2,
+    "A": 1,
+    "E": 0,
+    "I": 1
+  },
   "state_before": {
-    "contact": 60,
-    "resistance": 40,
-    "progress": 30
+    "contact": 63,
+    "resistance": 30,
+    "progress": 56
   },
   "state_delta": {
-    "contact": -5,
-    "resistance": -3,
-    "progress": 10
+    "contact": 5,
+    "resistance": -5,
+    "progress": 8
   },
   "state_after": {
-    "contact": 55,
-    "resistance": 37,
-    "progress": 40
+    "contact": 68,
+    "resistance": 25,
+    "progress": 64
   },
   "features": {
     "result_clarity": "clear",
-    "actionability": "high"
+    "actionability": "high",
+    "alternative_present": true
   },
-  "communication_fit": 2
+  "communication_fit": 1.0,
+  "critical_flags": [],
+  "terminal_check": {
+    "success": false,
+    "failure": false,
+    "timeout": false
+  }
 }
 ```
 
-Событие должно позволять определить:
+Поддерживаемые `event_type`:
 
-- какое действие его вызвало;
-- какое состояние было до обработки;
-- какие изменения произошли;
-- какое состояние сформировалось после обработки;
-- какие признаки были использованы;
-- какие правила были применены.
+| Тип | Назначение |
+|---|---|
+| `session_started` | создана игровая сессия |
+| `turn_submitted` | пользователь отправил сообщение |
+| `action_classified` | определён `action_type` |
+| `action_processed` | применён scoring |
+| `hint_used` | использована подсказка |
+| `contact_lost` | контакт достиг порога |
+| `contact_recovered` | контакт восстановлен |
+| `goal_reached` | выполнены условия цели |
+| `scenario_completed` | зафиксирован успех |
+| `scenario_failed` | зафиксировано поражение |
+| `scenario_timeout` | достигнут лимит ходов |
+| `cancel_action` | пользователь завершил игру |
 
-Формат `event_id`, временных меток и идентификаторов сценария должен быть согласован с технической архитектурой.
+Каждое событие должно содержать идентификаторы версии конфигурации, чтобы исторические результаты можно было корректно воспроизвести.
 
 ---
 
@@ -703,30 +948,215 @@ Final Result = 0.50 * Goal Result + 0.30 * Negotiation Quality + 0.20 * PAEI Res
 |---|---|---|---|
 | `active` | `neutral_action` | нет терминальных условий | `active` |
 | `active` | `positive_action` | обновление параметров | `active` |
+| `active` | `strong_positive` | обновление параметров | `active` |
 | `active` | `negative_action` | обновление параметров | `active` |
-| `active` | `critical_error` | достигнут лимит ошибок или нет | `failure` / `active` |
-| `active` | `contact_lost` | контакт ниже порога | `contact_lost` / `failure` |
-| `contact_lost` | `recovery_action` | выполнено условие восстановления | `active` |
-| `active` | `goal_reached` | выполнены все условия цели | `success` |
-| `active` | `turn_limit_reached` | достигнут лимит ходов | `timeout` / `failure` |
+| `active` | `critical_error` | `critical_errors < 3` | `active` |
+| `active` | `critical_error` | `critical_errors >= 3` | `failure` |
+| `active` | `contact_lost` | `contact <= 20` | `contact_lost` |
+| `contact_lost` | `recovery_action` | условия восстановления выполнены | `active` |
+| `contact_lost` | `recovery_action` | условия восстановления не выполнены | `failure` |
+| `active` | `goal_reached` | `progress >= 80` + обязательные цели | `success` |
+| `active` | `turn_limit_reached` | `turn_number >= 12` и успех не достигнут | `timeout` |
+| `contact_lost` | `turn_limit_reached` | восстановление не выполнено в отведённый ход | `failure` |
 | `active` | `cancel_action` | пользователь завершил игру | `cancelled` |
 
 ---
 
-## 18. Условия завершения
+## 18. Условия победы, поражения и приоритет терминальных условий
 
-Каждое условие завершения должно иметь проверяемый критерий.
+### 18.1. Победа
 
-| Условие | Проверка | Итог |
-|---|---|---|
-| Цель достигнута | `progress >= 80` и выполнены обязательные условия | `success` |
-| Потеря контакта | `contact <= 20` | `contact_lost` / `failure` |
-| Лимит ошибок | `critical_errors >= 3` | `failure` |
-| Лимит ходов | `turn_number >= 12` | `timeout` |
-| Завершение сценария | выполнены сценарные условия | `success` / `failure` |
-| Отмена | `cancel_action` | `cancelled` |
+Состояние `success` фиксируется, если одновременно выполнены:
 
-При конфликте условий приоритет должен быть определён заранее в сценарной конфигурации. Рекомендуется проверять критические терминальные условия до общего условия успеха.
+```text
+progress >= 80
+AND all(mandatory_goals == completed)
+AND contact > 20
+AND critical_errors < critical_error_limit
+```
+
+При этом достижение высокого `Final Result` не заменяет обязательные условия.
+
+### 18.2. Поражение
+
+Состояние `failure` фиксируется при любом из условий:
+
+```text
+critical_errors >= critical_error_limit
+```
+
+или:
+
+```text
+contact <= 20
+AND recovery_attempt_failed
+```
+
+или:
+
+```text
+hard_constraint_broken == true
+```
+
+или:
+
+```text
+scenario_failure_condition == true
+```
+
+### 18.3. Приоритет терминальных условий
+
+После каждого хода Game Engine проверяет терминальные условия в фиксированном порядке:
+
+```text
+1. cancel_action
+2. critical_error_limit
+3. contact_loss
+4. hard_failure_condition
+5. success_condition
+6. turn_limit
+```
+
+Правила одновременного срабатывания:
+
+| Одновременные условия | Итог |
+|---|---|
+| `critical_error` + `success_condition` | `failure` |
+| `contact_loss` + `success_condition` | `contact_lost` |
+| `hard_failure` + `success_condition` | `failure` |
+| `success_condition` + `turn_limit` | `success` |
+| `cancel_action` до проверки результата | `cancelled` |
+
+Если состояние переходит в `contact_lost`, `turn_limit` начинает проверяться после разрешённого хода на восстановление.
+
+---
+
+## 19. Техническая интеграция
+
+MVP реализуется как разделение ответственности между шестью слоями:
+
+```text
+Client UI
+   ↓
+Session API
+   ↓
+Scenario Manager
+   ↓
+Evaluator
+   ↓
+PAEI Engine + Game Engine
+   ↓
+Reaction Model / AI Opponent
+```
+
+### 19.1. Ответственность компонентов
+
+| Компонент | Ответственность |
+|---|---|
+| `Client UI` | отображает сценарий, сообщения, подсказки и итог |
+| `Session API` | создаёт сессии и принимает ходы |
+| `Scenario Manager` | хранит правила конкретного сценария и обязательные условия |
+| `Evaluator` | извлекает наблюдаемые признаки, action type и fit для P/A/E/I |
+| `PAEI Engine` | рассчитывает четыре `profile_fit` и `paei_result` |
+| `Game Engine` | меняет `Game State`, применяет scoring и терминальные условия |
+| `Reaction Model` | выбирает намерение и интенсивность реакции NPC |
+| `AI Opponent` | формирует финальную реплику NPC |
+
+Ключевое правило:
+
+```text
+AI Opponent НЕ изменяет Game State напрямую.
+```
+
+Все числовые изменения проходят только через `Game Engine`.
+
+### 19.2. MVP API
+
+Минимальные методы:
+
+```text
+POST /v1/sessions
+POST /v1/sessions/{session_id}/turns
+POST /v1/sessions/{session_id}/hints
+GET  /v1/sessions/{session_id}
+POST /v1/sessions/{session_id}/cancel
+```
+
+`POST /turns` принимает:
+
+```json
+{
+  "message": "Текст пользователя",
+  "client_turn_id": "turn-07"
+}
+```
+
+Evaluator возвращает структурированный результат:
+
+```json
+{
+  "action_type": "positive",
+  "profile_fit": {
+    "P": 2,
+    "A": 1,
+    "E": 0,
+    "I": 1
+  },
+  "weighted_paei_fit": 1.1,
+  "features": {
+    "actionability": "high",
+    "result_clarity": "clear",
+    "alternative_present": true
+  },
+  "critical_flags": []
+}
+```
+
+Game Engine возвращает:
+
+```json
+{
+  "turn_number": 7,
+  "state_delta": {
+    "contact": 5,
+    "resistance": -5,
+    "progress": 8
+  },
+  "state_after": {
+    "contact": 68,
+    "resistance": 25,
+    "progress": 64
+  },
+  "game_status": "active"
+}
+```
+
+### 19.3. Детерминированность и воспроизводимость
+
+Для повторяемого результата сохраняются:
+- версия сценария;
+- версия scoring-конфигурации;
+- версия PAEI-конфигурации;
+- результат Evaluator;
+- `state_before`;
+- `state_delta`;
+- `state_after`.
+
+При повторном воспроизведении существующий результат Evaluator не вычисляется заново: используется сохранённый структурированный вывод. Это гарантирует одинаковый Game State при одинаковом входе.
+
+### 19.4. Хранилище
+
+Для MVP достаточно:
+
+```text
+sessions
+scenarios
+scenario_versions
+turns
+game_events
+```
+
+`game_events` является источником аудита и восстановления состояния.
 
 ---
 
@@ -787,41 +1217,392 @@ Final Result = 0.50 * Goal Result + 0.30 * Negotiation Quality + 0.20 * PAEI Res
 
 ---
 
-## 21. Нерешённые вопросы
+## 21. Заполненные продуктовые и технические решения MVP
 
-Перед переводом документа в `APPROVED` необходимо согласовать:
+Ниже зафиксированы решения по всем пунктам, которые ранее оставались открытыми. Пункты, которых не было в прикреплённых материалах, являются проектным решением для завершения MVP.
 
-- основной пользовательский путь;
-- структуру переговорного сценария;
-- режимы игры;
-- начальные значения параметров;
-- числовые изменения contact, resistance и progress;
-- классификацию действий;
-- критерии критических ошибок;
-- правила потери и восстановления контакта;
-- условия победы и поражения;
-- виды подсказок;
-- влияние подсказок на scoring;
-- полный состав PAEI-профилей;
-- способ расчёта PAEI;
-- веса итоговой формулы;
-- параметры сложности;
-- формат событий;
-- техническую интеграцию;
-- приоритет терминальных условий.
+### 21.1. Основной пользовательский путь
 
-Ответственные:
+```text
+1. Запуск игры
+   ↓
+2. Выбор режима: Training / Scenario
+   ↓
+3. Выбор сложности (для Scenario): Easy / Normal / Hard
+   ↓
+4. Брифинг:
+   роль пользователя, роль NPC, цель, ограничения, доступные условия
+   ↓
+5. Начало переговоров
+   ↓
+6. Ход пользователя
+   ↓
+7. Evaluator:
+   features → P/A/E/I fit → action_type → critical flags
+   ↓
+8. Game Engine:
+   scoring → state update → terminal check
+   ↓
+9. Reaction Model + AI Opponent:
+   реакция NPC и ответ
+   ↓
+10. Следующий ход
+   ↓
+11. Успех / поражение / timeout / cancel
+   ↓
+12. Экран итогов:
+   goal_result, negotiation_quality, paei_result, Final Result
+   ↓
+13. Дебриф:
+   ключевые ошибки, сильные действия, использованные подсказки
+```
 
-- `@poliy01` — продуктовая логика, методология PAEI, scoring, подсказки, поведение NPC;
-- `@ILmanness` — техническая архитектура, API, структура данных и интеграция.
+Профиль NPC не раскрывается в начале сценария. Пользователь должен выводить его из коммуникации.
 
----
+### 21.2. Структура переговорного сценария
+
+Сценарий состоит из:
+- `briefing`;
+- `opening`;
+- `diagnosis`;
+- `bargaining`;
+- `closing`;
+- `result`.
+
+Каждый сценарий содержит одну главную цель, 2–4 обязательных условия и до 3 дополнительных целей.
+
+### 21.3. Режимы игры
+
+| Режим | Назначение | Ограничения |
+|---|---|---|
+| `training` | обучение и знакомство с механикой | Easy-правила, 5 подсказок, можно перезапустить сценарий |
+| `scenario` | полноценная игра | Easy / Normal / Hard, полный scoring |
+
+В `training` итоговый score показывается пользователю, но не используется для сравнения результатов между сценариями.
+
+### 21.4. Начальные значения параметров
+
+Базовые значения `Normal`:
+
+```yaml
+contact: 70
+resistance: 40
+progress: 0
+critical_errors: 0
+hints_used: 0
+turn_number: 0
+game_status: active
+negotiation_quality: 50
+paei_result: 50
+```
+
+### 21.5. Числовые изменения `contact`, `resistance`, `progress`
+
+| Действие | Contact | Resistance | Progress |
+|---|---:|---:|---:|
+| `strong_positive` | +8 | −8 | +12 |
+| `positive` | +5 | −5 | +8 |
+| `neutral` | 0 | 0 | +2 |
+| `negative` | −6 | +6 | 0 |
+| `critical_error` | −15 | +12 | −5 |
+| `recovery_action` | +15 | −10 | +5 |
+
+Все значения ограничиваются `0..100`.
+
+### 21.6. Классификация действий
+
+Используются шесть классов:
+
+```text
+strong_positive
+positive
+neutral
+negative
+critical_error
+recovery_action
+```
+
+`critical_error` определяется только сценарными правилами. PAEI может повысить или снизить fit, но не создаёт критическую ошибку автоматически.
+
+### 21.7. Критерии критических ошибок
+
+Универсальные MVP-коды:
+
+| `error_code` | Критерий |
+|---|---|
+| `HARD_CONSTRAINT_BREACH` | нарушено обязательное ограничение сценария |
+| `FALSE_FACT_ASSERTION` | пользователь сообщает сценарно опровергаемый факт как достоверный |
+| `UNAUTHORIZED_COMMITMENT` | пользователь принимает на себя обязательство, на которое сценарий не даёт полномочий |
+| `PERSONAL_ATTACK` | прямое личное унижение или оскорбление собеседника |
+| `THREAT_OR_COERCION` | угроза, принуждение или недопустимое давление |
+| `CONFIDENTIALITY_BREACH` | раскрыта информация, которую сценарий пометил как закрытую |
+| `MANDATORY_STEP_SKIPPED` | пропущено обязательное действие после явного предупреждения |
+
+Критическая ошибка всегда имеет отдельное событие и увеличивает `critical_errors` на `1`.
+
+### 21.8. Потеря и восстановление контакта
+
+Потеря:
+
+```text
+contact <= 20 → contact_lost
+```
+
+Восстановление доступно один раз и только на следующем ходу.
+
+Успешное восстановление:
+
+```text
+action_type = recovery_action
+AND conversation_progress = forward
+AND actionability = high
+AND weighted_paei_fit >= 0
+```
+
+После восстановления:
+
+```text
+contact +15
+resistance -10
+progress +5
+```
+
+Для Hard:
+
+```text
+weighted_paei_fit >= +1
+```
+
+Неудача восстановления → `failure`.
+
+### 21.9. Условия победы и поражения
+
+Победа:
+
+```text
+progress >= 80
+AND mandatory_goals_completed
+AND contact > 20
+AND critical_errors < limit
+```
+
+Поражение:
+
+```text
+critical_errors >= limit
+OR hard_constraint_broken
+OR failed_recovery
+OR scenario_failure_condition
+```
+
+`timeout` используется, если лимит ходов исчерпан без достижения успеха.
+
+### 21.10. Виды подсказок
+
+Используются пять типов:
+
+| Тип | Когда выдаётся |
+|---|---|
+| `direction` | пользователь не понимает, в какую сторону двигать разговор |
+| `context` | потеряно важное условие или ограничение |
+| `communication` | неверно выбран стиль сообщения для ситуации |
+| `mistake` | предыдущий ход содержал значимую ошибку |
+| `strategy` | нужен следующий стратегический шаг без готовой реплики |
+
+Лимиты: Easy `5`, Normal `3`, Hard `2`.
+
+Подсказка не должна содержать готовую формулировку ответа.
+
+### 21.11. Влияние подсказок на scoring
+
+```text
+−3 negotiation_quality за каждую подсказку
+```
+
+`goal_result` и `paei_result` напрямую не изменяются.
+
+### 21.12. Полный состав PAEI-профилей
+
+В игре используются:
+
+```text
+P — результат / действие
+A — порядок / управляемость
+E — возможности / будущее
+I — совместность / интеграция
+```
+
+Каждый NPC хранит четыре веса профиля. По умолчанию:
+
+```text
+P=0.25, A=0.25, E=0.25, I=0.25
+```
+
+Для доминирующих профилей используются шаблоны из раздела 11.
+
+### 21.13. Способ расчёта PAEI
+
+Для каждого хода:
+
+```text
+fit_P, fit_A, fit_E, fit_I ∈ [-2, +2]
+```
+
+Среднее по истории:
+
+```text
+average_fit_X = mean(fit_X)
+```
+
+Результат профиля:
+
+```text
+profile_result_X =
+    clamp(50 + 25 * average_fit_X, 0, 100)
+```
+
+Итог:
+
+```text
+paei_result =
+    0.25 * P_result
+  + 0.25 * A_result
+  + 0.25 * E_result
+  + 0.25 * I_result
+```
+
+Для сценариев с иными весами используются соответствующие `profile_weights`.
+
+### 21.14. Веса итоговой формулы
+
+Для MVP:
+
+```text
+w_goal = 0.50
+w_quality = 0.30
+w_paei = 0.20
+```
+
+Итог:
+
+```text
+Final Result =
+    0.50 * Goal Result
+  + 0.30 * Negotiation Quality
+  + 0.20 * PAEI Result
+```
+
+### 21.15. Параметры сложности
+
+| Параметр | Easy | Normal | Hard |
+|---|---:|---:|---:|
+| `initial_contact` | 80 | 70 | 60 |
+| `initial_resistance` | 20 | 40 | 60 |
+| `goal_threshold` | 80 | 80 | 80 |
+| `hint_limit` | 5 | 3 | 2 |
+| `turn_limit` | 15 | 12 | 10 |
+| `critical_error_limit` | 4 | 3 | 2 |
+| `negative_action_strength` | 4 | 6 | 8 |
+| `recovery_difficulty` | 0 | 1 | 2 |
+
+Базовая таблица scoring остаётся одинаковой; сложность изменяет только конфигурационные пороги и доступные ресурсы.
+
+### 21.16. Формат событий
+
+Все игровые события используют схему из раздела 16 и включают:
+
+```text
+event_id
+event_type
+session_id
+scenario_id
+scenario_version
+scoring_version
+turn_number
+state_before
+state_delta
+state_after
+profile_fit
+features
+terminal_check
+```
+
+### 21.17. Техническая интеграция
+
+MVP-разделение:
+
+```text
+UI
+→ Session API
+→ Scenario Manager
+→ Evaluator
+→ PAEI Engine
+→ Game Engine
+→ Reaction Model
+→ AI Opponent
+```
+
+Правила:
+1. UI не изменяет Game State.
+2. AI Opponent не изменяет Game State.
+3. Game Engine — единственный компонент, применяющий numeric scoring.
+4. Все события сохраняются в `game_events`.
+5. Конфигурации версионируются.
+6. При replay используется сохранённый результат Evaluator.
+
+### 21.18. Приоритет терминальных условий
+
+Итоговый порядок:
+
+```text
+cancel
+→ critical error limit
+→ contact loss
+→ hard failure
+→ success
+→ timeout
+```
+
+Это означает:
+- критическая ошибка имеет приоритет над успехом;
+- потеря контакта имеет приоритет над успехом;
+- достижение цели на последнем разрешённом ходу считается успехом;
+- после терминального состояния новые пользовательские действия не принимаются.
+
+### 21.19. Статус решений
+
+Все перечисленные выше параметры считаются **рабочей конфигурацией MVP (`DRAFT`)**, пока команда не внесёт изменение в versioned configuration.
+
+### 21.20. Контрольная таблица закрытых решений
+
+| Пункт | Решение MVP | Статус |
+|---|---|---|
+| Основной пользовательский путь | Брифинг → 4 фазы переговоров → scoring → реакция NPC → результат → дебриф | `DRAFT` |
+| Структура сценария | `opening → diagnosis → bargaining → closing` | `DRAFT` |
+| Режимы | `training` + `scenario`; в scenario доступны Easy/Normal/Hard | `DRAFT` |
+| Начальные значения | Normal: contact 70, resistance 40, progress 0 | `DRAFT` |
+| Изменения state | strong_positive / positive / neutral / negative / critical / recovery | `DRAFT` |
+| Классификация действий | фиксированные 6 классов с заданным порядком | `DRAFT` |
+| Критические ошибки | 7 универсальных error codes + сценарные ограничения | `DRAFT` |
+| Потеря / восстановление | contact ≤ 20; один ход на recovery; recovery +15/−10/+5 | `DRAFT` |
+| Победа / поражение | обязательные цели + progress ≥ 80; провал по terminal rules | `DRAFT` |
+| Подсказки | direction/context/communication/mistake/strategy | `DRAFT` |
+| Штраф за подсказку | −3 negotiation_quality | `DRAFT` |
+| PAEI | четыре профиля P/A/E/I и профильные веса | `DRAFT` |
+| Расчёт PAEI | средний fit по каждому профилю → нормализация → взвешенная агрегация | `DRAFT` |
+| Итоговые веса | goal 0.50 / quality 0.30 / PAEI 0.20 | `DRAFT` |
+| Сложность | конфигурационные параметры Easy/Normal/Hard | `DRAFT` |
+| События | versioned JSON event log | `DRAFT` |
+| Техническая интеграция | UI → API → Scenario → Evaluator → PAEI → Game Engine → Reaction/AI | `DRAFT` |
+| Приоритет terminal | cancel → critical → contact loss → hard failure → success → timeout | `DRAFT` |
 
 ## 22. История изменений
 
 | Версия | Дата | Изменения | Статус |
 |---|---|---|---|
-| `0.1` | `TBD` | Создан рабочий черновик | `DRAFT` |
-| `0.2` | `TBD` | Добавлена связь scoring с PAEI и разделение слоёв | `DRAFT` |
+| `0.1` | `2026-09-18` | Создан рабочий черновик | `DRAFT` |
+| `0.2` | `2026-09-18` | Добавлена связь scoring с PAEI и разделение слоёв | `DRAFT` |
 | `0.3` | `2026-09-18` | Заполнена числовая конфигурация MVP scoring, добавлены формулы и таблица действий | `DRAFT` |
-| `1.0` | `TBD` | Утверждены правила MVP и формат реализации | `TBD` |
+| `0.4` | `2026-09-18` | Заполнены пользовательский путь, сценарии, режимы, критические ошибки, recovery, PAEI P/A/E/I, техническая интеграция и приоритет терминальных условий | `DRAFT` |
+| `0.5` | `2026-09-18` | Уточнён взвешенный PAEI по четырём профилям, устранены противоречия формул и добавлена контрольная таблица решений | `DRAFT` |
+| `1.0` | `2026-09-18` | Утверждены правила MVP и формат реализации | `TBD` |
